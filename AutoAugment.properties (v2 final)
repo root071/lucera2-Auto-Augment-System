@@ -1,0 +1,78 @@
+# ========================================
+# AutoAugment Configuration
+# ========================================
+# Place this file in: config/AutoAugment.properties
+
+# ========================================
+# Life Stone Item IDs
+# ========================================
+# Comma-separated list of Life Stone item IDs that trigger auto-augment
+# Default includes all standard Life Stones (Mid-grade to Top-grade)
+LifeStones = 8723,8724,8725,8726,8727,8728,8729,8730,8731,8732,8733,8734,8735,8736,8737,8738,8739,8740,8741,8742,8743,8744,8745,8746,8747,8748,8749,8750,8751,8752,8753,8754,8755,8756,8757,8758,8759,8760,8761,8762
+
+# ========================================
+# User Interface Settings
+# ========================================
+# Show confirmation dialog before overwriting a "good" augment
+# true = ask player before replacing good augment
+# false = automatically replace any augment
+UI_Confirm = true
+
+# Text shown in the confirmation dialog
+# You can use {AUG} placeholder to show current augment details
+UI_Confirm_Text = Your weapon already has a good augment. Overwrite it?
+
+# Show current augment details in the confirmation popup
+# true = display what skills/stats the current augment has
+# false = only show the confirmation text
+ShowAugmentInPopup = true
+
+# ========================================
+# "Good Augment" Detection Rules
+# ========================================
+# These settings determine what counts as a "good" augment
+# that should be protected by the confirmation dialog
+
+# Consider ANY skill (active/passive/toggle) as "good"
+# true = any augment with a skill is considered good
+# false = only skills + stats from whitelist are good
+GoodAugment_SkillAny = true
+
+# Stat keywords that make an augment "good"
+# Checks if augment description contains these strings
+# Common stats: STR, CON, DEX, INT, WIT, MEN, P.ATK, M.ATK, SPEED, etc.
+GoodAugment_StatWhitelist = STR,CON,DEX,INT,WIT,MEN
+
+# Specific augment option IDs that are always considered "good"
+# Leave empty to rely on skill/stat detection only
+# Example: GoodAugment_OptionWhitelist = 16341,16342,16343
+GoodAugment_OptionWhitelist = 
+
+# ========================================
+# EXAMPLES OF CUSTOM CONFIGURATIONS
+# ========================================
+
+# Example 1: Only protect augments with skills (ignore stats)
+# GoodAugment_SkillAny = true
+# GoodAugment_StatWhitelist = 
+
+# Example 2: Only protect specific stats (P.Atk, M.Atk, Speed)
+# GoodAugment_SkillAny = true
+# GoodAugment_StatWhitelist = P.ATK,M.ATK,SPEED,CRITICAL
+
+# Example 3: Protect specific rare augment IDs
+# GoodAugment_OptionWhitelist = 16341,16342,16343,16344
+
+# Example 4: Never ask confirmation (always overwrite)
+# UI_Confirm = false
+
+# Example 5: Custom confirmation message with augment details
+# UI_Confirm_Text = Current augment: {AUG}\n\nAre you sure you want to replace it?
+
+# ========================================
+# NOTES
+# ========================================
+# - All Life Stones consume their respective gemstones as normal
+# - The script respects server augmentation rules and fees
+# - Hero weapons, cursed items, and shadow items cannot be augmented
+# - Player must have weapon equipped to use auto-augment
