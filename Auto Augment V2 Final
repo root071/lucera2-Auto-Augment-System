@@ -1,0 +1,554 @@
+package services.autoaugment;
+
+import java.io.File;
+import java.lang.reflect.Method;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import l2.commons.configuration.ExProperties;
+import l2.gameserver.handler.items.IItemHandler;
+import l2.gameserver.handler.items.ItemHandler;
+import l2.gameserver.handler.items.RefineryHandler;
+import l2.gameserver.listener.actor.player.OnAnswerListener;
+import l2.gameserver.model.Playable;
+import l2.gameserver.model.Player;
+import l2.gameserver.model.Skill;
+import l2.gameserver.model.actor.instances.player.ShortCut;
+import l2.gameserver.model.items.Inventory;
+import l2.gameserver.model.items.ItemContainer;
+import l2.gameserver.model.items.ItemInstance;
+import l2.gameserver.network.l2.components.SystemMsg;
+import l2.gameserver.network.l2.s2c.ConfirmDlg;
+import l2.gameserver.network.l2.s2c.InventoryUpdate;
+import l2.gameserver.network.l2.s2c.ShortCutRegister;
+import l2.gameserver.scripts.ScriptFile;
+import l2.gameserver.utils.Location;
+import l2.gameserver.data.xml.holder.VariationGroupHolder;
+import l2.gameserver.templates.item.support.VariationGroupData;
+import l2.gameserver.data.xml.holder.OptionDataHolder;
+import l2.gameserver.templates.OptionDataTemplate;
+
+public final class AutoAugment implements ScriptFile, IItemHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(AutoAugment.class);
+
+    // Constants
+    private static final int SHORTCUT_TYPE_ITEM = 1;
+    private static final int DIALOG_TIMEOUT_MS = 15000;
+
+    // Config defaults
+    private static Set<Integer> LIFE_STONES = new LinkedHashSet<>(Arrays.asList(
+            8723,8724,8725,8726,8727,8728,8729,8730,8731,8732,8733,8734,8735,8736,8737,8738,8739,8740,8741,8742,8743,8744,8745,8746,8747,8748,8749,8750,8751,8752,8753,8754,8755,8756,8757,8758,8759,8760,8761,8762
+    ));
+    private static boolean UI_CONFIRM = true;
+    private static String UI_CONFIRM_TEXT = "Your weapon already has a good augment. Overwrite it?";
+    private static boolean GOOD_SKILL_ANY = true;
+    private static Set<String> GOOD_STAT_WHITELIST =
+            new LinkedHashSet<>(Arrays.asList("STR","CON","DEX","INT","WIT","MEN"));
+    private static Set<Integer> GOOD_OPTION_WHITELIST = new LinkedHashSet<>();
+    private static boolean SHOW_AUGMENT_IN_POPUP = true;
+
+    // Cached reflection
+    private static Method GET_TRIGGERS_METHOD;
+    private static boolean TRIGGERS_SUPPORTED = false;
+
+    // Thread safety - but cleanup after use
+    private static final ConcurrentHashMap<Integer, Object> LOCKS = new ConcurrentHashMap<>();
+
+    static {
+        try {
+            GET_TRIGGERS_METHOD = OptionDataTemplate.class.getMethod("getTriggers");
+            TRIGGERS_SUPPORTED = true;
+        } catch (NoSuchMethodException e) {
+            // Silent - triggers not supported in this server version
+            TRIGGERS_SUPPORTED = false;
+        } catch (Exception e) {
+            log.error("Unexpected error initializing reflection", e);
+        }
+    }
+
+    @Override
+    public void onLoad() {
+        loadConfig();
+        try {
+            ItemHandler.getInstance().registerItemHandler(this);
+        } catch (Exception e) {
+            log.error("Failed to register AutoAugment handler", e);
+        }
+    }
+
+    @Override public void onReload() { loadConfig(); }
+    @Override public void onShutdown() { LOCKS.clear(); }
+
+    @Override
+    public boolean useItem(Playable playable, ItemInstance lifeStone, boolean ctrl) {
+        if (!(playable instanceof Player)) return false;
+        Player player = (Player) playable;
+
+        if (lifeStone == null || !LIFE_STONES.contains(lifeStone.getItemId())) {
+            return false;
+        }
+
+        ItemInstance weapon = getEquippedWeapon(player);
+        if (weapon == null || !isAugmentable(weapon)) {
+            return false;
+        }
+
+        Object lock = LOCKS.computeIfAbsent(player.getObjectId(), k -> new Object());
+        try {
+            synchronized (lock) {
+                return processAugmentation(player, weapon, lifeStone);
+            }
+        } finally {
+            LOCKS.remove(player.getObjectId()); // Prevent memory leak
+        }
+    }
+
+    private boolean processAugmentation(Player player, ItemInstance weapon, ItemInstance lifeStone) {
+        if (!recheck(player, weapon)) {
+            return false;
+        }
+
+        boolean hasAug = hasAugmentation(weapon);
+        boolean isGood = hasAug && isGoodAugment(weapon);
+
+        if (hasAug && isGood && UI_CONFIRM) {
+            showConfirmationDialog(player, weapon, lifeStone);
+            return true;
+        }
+
+        ensureUnaugmented(player, weapon);
+        doRefineViaCore(player, weapon, lifeStone);
+        return true;
+    }
+
+    private void showConfirmationDialog(Player player, ItemInstance weapon, ItemInstance lifeStone) {
+        String text = UI_CONFIRM_TEXT;
+
+        if (SHOW_AUGMENT_IN_POPUP) {
+            String desc = describeAugment(weapon);
+            text = text.contains("{AUG}")
+                    ? text.replace("{AUG}", desc)
+                    : ("Augment: " + desc + "\n" + UI_CONFIRM_TEXT);
+        }
+
+        ConfirmDlg dlg = new ConfirmDlg(SystemMsg.S1, DIALOG_TIMEOUT_MS);
+        dlg.addString(text);
+
+        player.ask(dlg, new OnAnswerListener() {
+            @Override
+            public void sayYes() {
+                Object lock = LOCKS.computeIfAbsent(player.getObjectId(), k -> new Object());
+                try {
+                    synchronized (lock) {
+                        if (!recheck(player, weapon)) return;
+                        ensureUnaugmented(player, weapon);
+                        doRefineViaCore(player, weapon, lifeStone);
+                    }
+                } finally {
+                    LOCKS.remove(player.getObjectId());
+                }
+            }
+            @Override public void sayNo() { }
+        });
+    }
+
+    @Override public void dropItem(Player player, ItemInstance item, long count, Location loc) { }
+    @Override public boolean pickupItem(Playable playable, ItemInstance item) { return false; }
+    @Override public int[] getItemIds() {
+        return LIFE_STONES.stream().mapToInt(Integer::intValue).toArray();
+    }
+
+    // === Refine logic ===
+    private static void doRefineViaCore(Player player, ItemInstance weapon, ItemInstance lifeStone) {
+        if (!recheck(player, weapon) || hasAugmentation(weapon)) {
+            ensureUnaugmented(player, weapon);
+        }
+
+        int beforeA = getVarStat(weapon, true);
+        int beforeB = getVarStat(weapon, false);
+
+        VariationGroupData fee = resolveFeeFor(weapon, lifeStone);
+        if (fee == null) {
+            log.warn("No variation fee found for weapon {} with stone {}",
+                    weapon.getItemId(), lifeStone.getItemId());
+            return;
+        }
+
+        final int gemId = fee.getGemstoneItemId();
+        final long gemNeed = fee.getGemstoneItemCnt();
+        ItemContainer inv = player.getInventory();
+
+        if (inv == null) return;
+
+        // Single pass inventory check
+        long gemCount = inv.getCountOf(gemId);
+        long stoneCount = inv.getCountOf(lifeStone.getItemId());
+
+        if (gemCount < gemNeed || stoneCount < 1) {
+            return;
+        }
+
+        ItemInstance gemstones = inv.getItemByItemId(gemId);
+        try {
+            RefineryHandler.getInstance().onRequestRefine(player, weapon, lifeStone, gemstones, gemNeed);
+        } catch (Exception e) {
+            log.error("Refine failed for player {}", player.getName(), e);
+            return;
+        }
+
+        int afterA = getVarStat(weapon, true);
+        int afterB = getVarStat(weapon, false);
+
+        if (afterA != beforeA || afterB != beforeB) {
+            notifyAugmentSuccess(player, weapon);
+        }
+    }
+
+    private static void notifyAugmentSuccess(Player player, ItemInstance weapon) {
+        try {
+            player.sendPacket(SystemMsg.THE_ITEM_WAS_SUCCESSFULLY_AUGMENTED);
+            player.sendPacket(new InventoryUpdate().addModifiedItem(weapon));
+        } catch (Exception e) {
+            log.error("Failed to notify augment success", e);
+        }
+    }
+
+    // === Unaugment logic ===
+    private static void ensureUnaugmented(Player player, ItemInstance weapon) {
+        if (!hasAugmentation(weapon)) return;
+
+        try {
+            RefineryHandler.getInstance().onRequestCancelRefine(player, weapon);
+        } catch (Exception e) {
+            log.error("Failed to cancel refine via handler", e);
+        }
+
+        if (!hasAugmentation(weapon)) {
+            updateInventory(player, weapon);
+            return;
+        }
+
+        // Force remove augmentation
+        boolean wasEquipped = isEquipped(weapon);
+
+        if (wasEquipped) {
+            try { player.getInventory().unEquipItem(weapon); }
+            catch (Exception e) { log.error("Failed to unequip weapon", e); }
+        }
+
+        try {
+            weapon.setVariationStat1(0);
+            weapon.setVariationStat2(0);
+            weapon.save();
+        } catch (Exception e) {
+            log.error("Failed to clear augmentation", e);
+        }
+
+        if (wasEquipped) {
+            try { player.getInventory().equipItem(weapon); }
+            catch (Exception e) { log.error("Failed to re-equip weapon", e); }
+        }
+
+        updateInventory(player, weapon);
+        updateShortcuts(player, weapon);
+    }
+
+    private static void updateInventory(Player player, ItemInstance weapon) {
+        try {
+            player.sendPacket(new InventoryUpdate().addModifiedItem(weapon));
+        } catch (Exception e) {
+            log.error("Failed to update inventory", e);
+        }
+    }
+
+    private static void updateShortcuts(Player player, ItemInstance weapon) {
+        try {
+            for (ShortCut sc : player.getAllShortCuts()) {
+                if (sc.getId() == weapon.getObjectId() && sc.getType() == SHORTCUT_TYPE_ITEM) {
+                    player.sendPacket(new ShortCutRegister(player, sc));
+                }
+            }
+        } catch (Exception e) {
+            log.error("Failed to update shortcuts", e);
+        }
+    }
+
+    // === Variation fee ===
+    private static VariationGroupData resolveFeeFor(ItemInstance weapon, ItemInstance lifeStone) {
+        try {
+            List<VariationGroupData> list = VariationGroupHolder.getInstance()
+                    .getDataForItemId(weapon.getItemId());
+
+            if (list == null || list.isEmpty()) return null;
+
+            for (VariationGroupData g : list) {
+                if (g.getMineralItemId() == lifeStone.getItemId()) {
+                    return g;
+                }
+            }
+        } catch (Exception e) {
+            log.error("Failed to resolve variation fee", e);
+        }
+        return null;
+    }
+
+    // === Good-augment detection ===
+    private static boolean hasAugmentation(ItemInstance weapon) {
+        return getVarStat(weapon, true) != 0 || getVarStat(weapon, false) != 0;
+    }
+
+    private static boolean isGoodAugment(ItemInstance weapon) {
+        int[] opts = getAugmentOptions(weapon);
+        if (opts.length == 0) return false;
+
+        // Check whitelist first (fastest)
+        for (int id : opts) {
+            if (GOOD_OPTION_WHITELIST.contains(id)) return true;
+        }
+
+        // Check skills and stats
+        try {
+            for (int id : opts) {
+                OptionDataTemplate tpl = OptionDataHolder.getInstance().getTemplate(id);
+                if (tpl == null) continue;
+
+                if (hasGoodSkills(tpl) || hasGoodTriggers(tpl) || hasGoodStats(tpl)) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            log.error("Error checking augment quality", e);
+        }
+
+        return false;
+    }
+
+    private static boolean hasGoodSkills(OptionDataTemplate tpl) {
+        if (!GOOD_SKILL_ANY) return false;
+        List<Skill> skills = tpl.getSkills();
+        return skills != null && !skills.isEmpty();
+    }
+
+    private static boolean hasGoodTriggers(OptionDataTemplate tpl) {
+        if (!TRIGGERS_SUPPORTED) return false;
+
+        try {
+            Object triggers = GET_TRIGGERS_METHOD.invoke(tpl);
+            return triggers instanceof Collection && !((Collection<?>) triggers).isEmpty();
+        } catch (Exception e) {
+            // Silent - method invocation failed
+            return false;
+        }
+    }
+
+    private static boolean hasGoodStats(OptionDataTemplate tpl) {
+        if (GOOD_STAT_WHITELIST.isEmpty()) return false;
+
+        String templateStr = String.valueOf(tpl).toUpperCase();
+        for (String stat : GOOD_STAT_WHITELIST) {
+            if (templateStr.contains(stat)) return true;
+        }
+        return false;
+    }
+
+    private static int[] getAugmentOptions(ItemInstance weapon) {
+        int a = getVarStat(weapon, true);
+        int b = getVarStat(weapon, false);
+
+        if (a > 0 && b > 0) return new int[]{a, b};
+        if (a > 0) return new int[]{a};
+        if (b > 0) return new int[]{b};
+        return new int[0];
+    }
+
+    private static String describeAugment(ItemInstance weapon) {
+        int[] opts = getAugmentOptions(weapon);
+        if (opts.length == 0) return "None";
+
+        List<String> parts = new ArrayList<>();
+
+        for (int id : opts) {
+            OptionDataTemplate tpl = OptionDataHolder.getInstance().getTemplate(id);
+            if (tpl == null) {
+                parts.add("Option#" + id);
+                continue;
+            }
+
+            addSkillDescriptions(tpl, parts);
+            addTriggerDescription(tpl, parts);
+            addStatDescriptions(tpl, parts);
+        }
+
+        return parts.isEmpty()
+                ? ("Option IDs: " + Arrays.toString(opts))
+                : String.join(" | ", parts);
+    }
+
+    private static void addSkillDescriptions(OptionDataTemplate tpl, List<String> parts) {
+        List<Skill> skills = tpl.getSkills();
+        if (skills == null || skills.isEmpty()) return;
+
+        for (Skill skill : skills) {
+            String kind = skill.isActive() ? "Active"
+                    : (skill.isPassive() ? "Passive" : "Toggle");
+            parts.add(String.format("%s: %s Lv.%d", kind, skill.getName(), skill.getLevel()));
+        }
+    }
+
+    private static void addTriggerDescription(OptionDataTemplate tpl, List<String> parts) {
+        if (!TRIGGERS_SUPPORTED) return;
+
+        try {
+            Object triggers = GET_TRIGGERS_METHOD.invoke(tpl);
+            if (triggers instanceof Collection && !((Collection<?>) triggers).isEmpty()) {
+                parts.add("Chance effect(s)");
+            }
+        } catch (Exception e) {
+            // Silent - method invocation failed
+        }
+    }
+
+    private static void addStatDescriptions(OptionDataTemplate tpl, List<String> parts) {
+        String templateStr = String.valueOf(tpl).toUpperCase();
+        List<String> foundStats = new ArrayList<>();
+
+        for (String stat : GOOD_STAT_WHITELIST) {
+            if (templateStr.contains(stat)) {
+                foundStats.add(stat);
+            }
+        }
+
+        if (!foundStats.isEmpty()) {
+            parts.add("Stats: " + String.join("/", foundStats));
+        }
+    }
+
+    // === Helpers ===
+    private static int getVarStat(ItemInstance weapon, boolean first) {
+        try {
+            return first ? weapon.getVariationStat1() : weapon.getVariationStat2();
+        } catch (Exception e) {
+            log.error("Failed to get variation stat", e);
+            return 0;
+        }
+    }
+
+    private static boolean isEquipped(ItemInstance weapon) {
+        try { return weapon.isEquipped(); }
+        catch (Exception e) { return false; }
+    }
+
+    private static ItemInstance getEquippedWeapon(Player player) {
+        Inventory inv = player.getInventory();
+        if (inv == null) return null;
+
+        ItemInstance weapon = inv.getPaperdollItem(Inventory.PAPERDOLL_RHAND);
+        if (weapon == null) {
+            weapon = inv.getPaperdollItem(Inventory.PAPERDOLL_LRHAND);
+        }
+        return weapon;
+    }
+
+    private static boolean isAugmentable(ItemInstance weapon) {
+        try {
+            if (weapon.isHeroWeapon() || weapon.isCursed() || weapon.isShadowItem()) {
+                return false;
+            }
+
+            List<VariationGroupData> list = VariationGroupHolder.getInstance()
+                    .getDataForItemId(weapon.getItemId());
+            return list != null && !list.isEmpty();
+        } catch (Exception e) {
+            log.error("Failed to check if augmentable", e);
+            return false;
+        }
+    }
+
+    private static boolean recheck(Player player, ItemInstance weapon) {
+        if (player == null || weapon == null) return false;
+
+        try {
+            return weapon.getOwnerId() == player.getObjectId();
+        } catch (Exception e) {
+            log.error("Ownership check failed", e);
+            return false;
+        }
+    }
+
+    // === Config loading ===
+    private static void loadConfig() {
+        try {
+            File configFile = new File("config/AutoAugment.properties");
+            if (!configFile.exists()) {
+                log.info("Config file not found, using defaults");
+                return;
+            }
+
+            ExProperties props = new ExProperties();
+            props.load(configFile);
+
+            LIFE_STONES = parseIntSet(props.getProperty("LifeStones", joinInts(LIFE_STONES)));
+            UI_CONFIRM = parseBoolean(props.getProperty("UI_Confirm", "true"));
+            UI_CONFIRM_TEXT = props.getProperty("UI_Confirm_Text", UI_CONFIRM_TEXT);
+            GOOD_SKILL_ANY = parseBoolean(props.getProperty("GoodAugment_SkillAny", "true"));
+            GOOD_STAT_WHITELIST = parseStrSet(props.getProperty("GoodAugment_StatWhitelist",
+                    joinStr(GOOD_STAT_WHITELIST)));
+            GOOD_OPTION_WHITELIST = parseIntSet(props.getProperty("GoodAugment_OptionWhitelist", ""));
+            SHOW_AUGMENT_IN_POPUP = parseBoolean(props.getProperty("ShowAugmentInPopup", "true"));
+
+            log.info("AutoAugment config loaded successfully");
+        } catch (Exception e) {
+            log.error("Failed to load config, using defaults", e);
+        }
+    }
+
+    private static boolean parseBoolean(String value) {
+        return "true".equalsIgnoreCase(value);
+    }
+
+    private static Set<Integer> parseIntSet(String str) {
+        if (str == null || str.trim().isEmpty()) {
+            return new LinkedHashSet<>();
+        }
+
+        return Arrays.stream(str.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .map(s -> {
+                    try {
+                        return Integer.parseInt(s);
+                    } catch (NumberFormatException e) {
+                        log.warn("Invalid integer in config: {}", s);
+                        return null;
+                    }
+                })
+                .filter(Objects::nonNull)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+
+    private static Set<String> parseStrSet(String str) {
+        if (str == null || str.trim().isEmpty()) {
+            return new LinkedHashSet<>();
+        }
+
+        return Arrays.stream(str.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .map(String::toUpperCase)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+
+    private static String joinInts(Collection<Integer> collection) {
+        return collection.stream()
+                .map(String::valueOf)
+                .collect(Collectors.joining(","));
+    }
+
+    private static String joinStr(Collection<String> collection) {
+        return String.join(",", collection);
+    }
+}
