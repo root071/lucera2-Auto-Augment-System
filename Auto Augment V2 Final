@@ -156,8 +156,32 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
         });
     }
 
-    @Override public void dropItem(Player player, ItemInstance item, long count, Location loc) { }
-    @Override public boolean pickupItem(Playable playable, ItemInstance item) { return false; }
+    @Override
+public void dropItem(Player player, ItemInstance item, long count, Location loc) {
+    if (player == null || item == null) return;
+    try {
+        // спазвай ядрените ограничения за drop
+        if (!item.canBeDropped(player, true)) return;
+
+        if (loc == null) loc = player.getLoc();
+        item.dropToTheGround(player, loc);
+    } catch (Exception e) {
+        log.error("[AA] dropItem error", e);
+    }
+}
+
+@Override
+public boolean pickupItem(Playable playable, ItemInstance item) {
+    if (playable == null || item == null) return false;
+    try {
+        playable.doPickupItem(item);
+        return true;
+    } catch (Exception e) {
+        log.error("[AA] pickupItem error", e);
+        return false;
+    }
+}
+
     @Override public int[] getItemIds() {
         return LIFE_STONES.stream().mapToInt(Integer::intValue).toArray();
     }
