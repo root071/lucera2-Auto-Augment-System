@@ -74,7 +74,6 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
             boolean hasAug = hasAugmentation(weapon);
             boolean good = hasAug && isGoodAugment(weapon);
 
-            // винаги чистим; питаме само ако е „хубав“
             if (hasAug && good && UI_CONFIRM) {
                 ConfirmDlg dlg = new ConfirmDlg(SystemMsg.S1, 15000);
                 dlg.addString(UI_CONFIRM_TEXT);
@@ -89,21 +88,44 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
                 return true;
             }
 
-            ensureUnaugmented(p, weapon);              // твърдо премахване
-            doRefineViaCore(p, weapon, lifeStone);     // нов аугмент
+            ensureUnaugmented(p, weapon);
+            doRefineViaCore(p, weapon, lifeStone);
         }
         return true;
     }
 
-    @Override public void dropItem(Player player, ItemInstance item, long count, Location loc) { /* not used */ }
-    @Override public boolean pickupItem(Playable playable, ItemInstance item) { return false; /* not used */ }
+    @Override
+public void dropItem(Player player, ItemInstance item, long count, Location loc) {
+    if (player == null || item == null) return;
+    try {
+       
+        if (!item.canBeDropped(player, true)) return;
+
+        if (loc == null) loc = player.getLoc();
+        item.dropToTheGround(player, loc); 
+    } catch (Exception e) {
+        log.error("[AA] dropItem error", e);
+    }
+}
+
+@Override
+public boolean pickupItem(Playable playable, ItemInstance item) {
+    if (playable == null || item == null) return false;
+    try {
+        playable.doPickupItem(item);
+        return true;
+    } catch (Exception e) {
+        log.error("[AA] pickupItem error", e);
+        return false;
+    }
+}
+
     @Override public int[] getItemIds() { return LIFE_STONES.stream().mapToInt(Integer::intValue).toArray(); }
 
     // === Refine ===
     private static void doRefineViaCore(Player p, ItemInstance weapon, ItemInstance lifeStone) {
         if (!recheck(p, weapon)) return;
 
-        // гаранция: чисто преди refine
         if (hasAugmentation(weapon)) ensureUnaugmented(p, weapon);
 
         int beforeA = getVarStat(weapon, true), beforeB = getVarStat(weapon, false);
@@ -161,11 +183,9 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
         }
     }
 
-    // === Unaugment: първо core cancel, после принудително ===
     private static void ensureUnaugmented(Player p, ItemInstance w) {
         if (!hasAugmentation(w)) return;
 
-        // 1) официално сваляне (плаща адена)
         try { RefineryHandler.getInstance().onRequestCancelRefine(p, w); } catch (Throwable ignored) {}
 
         if (!hasAugmentation(w)) {
@@ -173,13 +193,11 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
             return;
         }
 
-        // 2) принудително: временно разекипирай, занули, реекипирай, save
         boolean wasEq = isEquipped(w);
         if (wasEq) {
             try { p.getInventory().unEquipItem(w); } catch (Throwable ignored) {}
         }
 
-        // директно извикване на публичните сетъри от ItemInstance (както core-а)
         try { w.setVariationStat1(0); } catch (Throwable ignored) {}
         try { w.setVariationStat2(0); } catch (Throwable ignored) {}
         try { w.save(); } catch (Throwable ignored) {}
@@ -188,15 +206,12 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
             try { p.getInventory().equipItem(w); } catch (Throwable ignored) {}
         }
 
-        // обнови инвентара и shortcuts за оръжието
         try {
             p.sendPacket(new InventoryUpdate().addModifiedItem(w));
             for (ShortCut sc : p.getAllShortCuts())
                 if (sc.getId() == w.getObjectId() && sc.getType() == 1)
                     p.sendPacket(new ShortCutRegister(p, sc));
         } catch (Throwable ignored) {}
-
-        // ако още е маркирано като аугментирано, няма да продължаваме
     }
 
     // === Variation fee ===
@@ -221,10 +236,8 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
         int[] opts = (a>0 && b>0) ? new int[]{a,b} : (a>0 ? new int[]{a} : (b>0 ? new int[]{b} : new int[0]));
         if (opts.length == 0) return false;
 
-        // 1) Явен whitelist по ID
         for (int id : opts) if (GOOD_OPTION_WHITELIST.contains(id)) return true;
 
-        // 2) Skill или Trigger (Chance) => "добър"
         try {
             Class<?> holderCls = Class.forName("l2.gameserver.data.xml.holder.OptionDataHolder");
             Object holder = holderCls.getMethod("getInstance").invoke(null);
@@ -232,7 +245,6 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
                 Object tmpl = holderCls.getMethod("getTemplate", int.class).invoke(holder, id);
                 if (tmpl == null) continue;
 
-                // skills (Active/Passive)
                 try {
                     Object skills = tmpl.getClass().getMethod("getSkills").invoke(tmpl); // List<Skill>
                     if (skills instanceof java.util.Collection && !((java.util.Collection<?>)skills).isEmpty())
@@ -246,7 +258,6 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
                         return true;
                 } catch (Throwable ignored) {}
 
-                // 3) По избор: стат ключови думи (остави ако ти трябва)
                 if (!GOOD_STAT_WHITELIST.isEmpty()) {
                     String s = String.valueOf(tmpl).toUpperCase();
                     for (String k : GOOD_STAT_WHITELIST) if (s.contains(k)) return true;
@@ -276,7 +287,6 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
     private static boolean isAugmentable(ItemInstance w) {
         try { if (w.isHeroWeapon() || w.isCursed() || w.isShadowItem()) return false; } catch (Throwable ignored) {}
         try { if (!w.isWeapon() && !w.isEquipable()) return false; } catch (Throwable ignored) {}
-        // разрешено ли е от VariationGroup за този itemId
         try {
             java.util.List<l2.gameserver.templates.item.support.VariationGroupData> list =
                     l2.gameserver.data.xml.holder.VariationGroupHolder.getInstance().getDataForItemId(w.getItemId());
@@ -288,7 +298,6 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
     private static boolean recheck(Player p, ItemInstance w) {
         if (p == null || w == null) return false;
         try { if (w.getOwnerId() != p.getObjectId()) return false; } catch (Throwable ignored) {}
-        // Няма isDestroyed()/isLocked() в твоя клас → не ги проверяваме
         return true;
     }
 
