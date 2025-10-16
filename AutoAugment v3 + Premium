@@ -1,7 +1,7 @@
+// ===== AutoAugment.java =====
 package services.autoaugment;
 
 import java.io.File;
-import java.lang.reflect.Method;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
@@ -59,13 +59,9 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
     @Override
     public void onLoad() {
         loadConfig();
-        try {
-            ItemHandler.getInstance().registerItemHandler(this);
-            log.info("AutoAugment: registered. PremiumOnly={}, BypassGM={}, LifeStones={}",
-                    PREMIUM_ONLY, PREMIUM_BYPASS_GM, LIFE_STONES.size());
-        } catch (Exception e) {
-            log.error("Failed to register AutoAugment handler", e);
-        }
+        ItemHandler.getInstance().registerItemHandler(this);
+        log.info("AutoAugment: registered. PremiumOnly={}, BypassGM={}, LS.count={}",
+                PREMIUM_ONLY, PREMIUM_BYPASS_GM, LIFE_STONES.size());
     }
 
     @Override public void onReload() { loadConfig(); }
@@ -75,28 +71,31 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
     public boolean useItem(Playable playable, ItemInstance lifeStone, boolean ctrl) {
         if (!(playable instanceof Player)) return false;
         Player player = (Player) playable;
-
         if (lifeStone == null) return false;
 
-        if (log.isDebugEnabled()) {
-            log.debug("AA.useItem: player={}, isGM={}, itemId={}, premiumOnly={}",
-                    player.getName(), safeIsGM(player), lifeStone.getItemId(), PREMIUM_ONLY);
-        }
+        boolean bonus;
+        try { bonus = player.hasBonus(); }
+        catch (Throwable t) { bonus = false; }
 
-        if (!LIFE_STONES.contains(lifeStone.getItemId())) {
-            if (log.isDebugEnabled()) log.debug("AA.useItem: itemId {} not in LIFE_STONES", lifeStone.getItemId());
-            return false;
-        }
+        log.info("[AA] useItem: player={}, isGM={}, itemId={}, PremiumOnly={}, BypassGM={}, hasBonus={}",
+                player.getName(), safeIsGM(player), lifeStone.getItemId(), PREMIUM_ONLY, PREMIUM_BYPASS_GM, bonus);
 
-        if (PREMIUM_ONLY && !isPremium(player)) {
-            if (log.isDebugEnabled()) log.debug("AA.useItem: blocked by premium gate for {}", player.getName());
-            safeMsg(player, PREMIUM_ONLY_MESSAGE);
-            return false;
+        if (!LIFE_STONES.contains(lifeStone.getItemId())) return false;
+
+        // Gate
+        if (PREMIUM_ONLY) {
+            if (PREMIUM_BYPASS_GM && safeIsGM(player)) {
+                player.sendMessage("[AA] GM bypass");
+            } else if (!bonus) {
+                player.sendMessage("[AA] Blocked: not premium");
+                safeMsg(player, PREMIUM_ONLY_MESSAGE);
+                return false;
+            }
         }
 
         ItemInstance weapon = getEquippedWeapon(player);
         if (weapon == null || !isAugmentable(weapon)) {
-            if (log.isDebugEnabled()) log.debug("AA.useItem: no augmentable weapon for {}", player.getName());
+            player.sendMessage("[AA] No augmentable weapon");
             return false;
         }
 
@@ -138,8 +137,7 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
         dlg.addString(text);
 
         player.ask(dlg, new OnAnswerListener() {
-            @Override
-            public void sayYes() {
+            @Override public void sayYes() {
                 Object lock = LOCKS.computeIfAbsent(player.getObjectId(), k -> new Object());
                 try {
                     synchronized (lock) {
@@ -147,19 +145,39 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
                         ensureUnaugmented(player, weapon);
                         doRefineViaCore(player, weapon, lifeStone);
                     }
-                } finally {
-                    LOCKS.remove(player.getObjectId());
-                }
+                } finally { LOCKS.remove(player.getObjectId()); }
             }
             @Override public void sayNo() { }
         });
     }
 
-    @Override public void dropItem(Player player, ItemInstance item, long count, Location loc) { }
-    @Override public boolean pickupItem(Playable playable, ItemInstance item) { return false; }
-    @Override public int[] getItemIds() {
-        return LIFE_STONES.stream().mapToInt(Integer::intValue).toArray();
+    @Override
+    public void dropItem(Player player, ItemInstance item, long count, Location loc) {
+        if (player == null || item == null) return;
+        try {
+            // спазвай ядрените ограничения за drop
+            if (!item.canBeDropped(player, true)) return;
+
+            if (loc == null) loc = player.getLoc();
+            item.dropToTheGround(player, loc); // правилният API в твоя ItemInstance
+        } catch (Exception e) {
+            log.error("[AA] dropItem error", e);
+        }
     }
+
+    @Override
+    public boolean pickupItem(Playable playable, ItemInstance item) {
+        if (playable == null || item == null) return false;
+        try {
+            playable.doPickupItem(item); // наличен в твоя Playable
+            return true;
+        } catch (Exception e) {
+            log.error("[AA] pickupItem error", e);
+            return false;
+        }
+    }
+
+    @Override public int[] getItemIds() { return LIFE_STONES.stream().mapToInt(Integer::intValue).toArray(); }
 
     private static void doRefineViaCore(Player player, ItemInstance weapon, ItemInstance lifeStone) {
         if (!recheck(player, weapon) || hasAugmentation(weapon)) ensureUnaugmented(player, weapon);
@@ -169,7 +187,7 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
 
         VariationGroupData fee = resolveFeeFor(weapon, lifeStone);
         if (fee == null) {
-            log.warn("AA: No variation fee for weapon {} with stone {}", weapon.getItemId(), lifeStone.getItemId());
+            log.warn("[AA] No variation fee for weapon {} with LS {}", weapon.getItemId(), lifeStone.getItemId());
             return;
         }
 
@@ -180,13 +198,16 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
 
         long gemCount = inv.getCountOf(gemId);
         long stoneCount = inv.getCountOf(lifeStone.getItemId());
-        if (gemCount < gemNeed || stoneCount < 1) return;
+        if (gemCount < gemNeed || stoneCount < 1) {
+            player.sendMessage("[AA] Not enough gemstones or stones");
+            return;
+        }
 
         ItemInstance gemstones = inv.getItemByItemId(gemId);
         try {
             RefineryHandler.getInstance().onRequestRefine(player, weapon, lifeStone, gemstones, gemNeed);
         } catch (Exception e) {
-            log.error("AA: Refine failed for {}", player.getName(), e);
+            log.error("[AA] Refine failed for {}", player.getName(), e);
             return;
         }
 
@@ -199,8 +220,9 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
         try {
             player.sendPacket(SystemMsg.THE_ITEM_WAS_SUCCESSFULLY_AUGMENTED);
             player.sendPacket(new InventoryUpdate().addModifiedItem(weapon));
+            player.sendMessage("[AA] Augment OK");
         } catch (Exception e) {
-            log.error("AA: notifyAugmentSuccess error", e);
+            log.error("[AA] notifyAugmentSuccess error", e);
         }
     }
 
@@ -210,7 +232,7 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
         try {
             RefineryHandler.getInstance().onRequestCancelRefine(player, weapon);
         } catch (Exception e) {
-            log.error("AA: cancel refine error", e);
+            log.error("[AA] cancel refine error", e);
         }
 
         if (!hasAugmentation(weapon)) {
@@ -220,7 +242,7 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
 
         boolean wasEquipped = isEquipped(weapon);
         if (wasEquipped) {
-            try { player.getInventory().unEquipItem(weapon); } catch (Exception e) { log.error("AA: unequip error", e); }
+            try { player.getInventory().unEquipItem(weapon); } catch (Exception e) { log.error("[AA] unequip error", e); }
         }
 
         try {
@@ -228,11 +250,11 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
             weapon.setVariationStat2(0);
             weapon.save();
         } catch (Exception e) {
-            log.error("AA: clear augmentation error", e);
+            log.error("[AA] clear augmentation error", e);
         }
 
         if (wasEquipped) {
-            try { player.getInventory().equipItem(weapon); } catch (Exception e) { log.error("AA: re-equip error", e); }
+            try { player.getInventory().equipItem(weapon); } catch (Exception e) { log.error("[AA] re-equip error", e); }
         }
 
         updateInventory(player, weapon);
@@ -240,11 +262,8 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
     }
 
     private static void updateInventory(Player player, ItemInstance weapon) {
-        try {
-            player.sendPacket(new InventoryUpdate().addModifiedItem(weapon));
-        } catch (Exception e) {
-            log.error("AA: inventory update error", e);
-        }
+        try { player.sendPacket(new InventoryUpdate().addModifiedItem(weapon)); }
+        catch (Exception e) { log.error("[AA] inventory update error", e); }
     }
 
     private static void updateShortcuts(Player player, ItemInstance weapon) {
@@ -254,9 +273,7 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
                     player.sendPacket(new ShortCutRegister(player, sc));
                 }
             }
-        } catch (Exception e) {
-            log.error("AA: shortcut update error", e);
-        }
+        } catch (Exception e) { log.error("[AA] shortcut update error", e); }
     }
 
     private static VariationGroupData resolveFeeFor(ItemInstance weapon, ItemInstance lifeStone) {
@@ -266,9 +283,7 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
             for (VariationGroupData g : list) {
                 if (g.getMineralItemId() == lifeStone.getItemId()) return g;
             }
-        } catch (Exception e) {
-            log.error("AA: resolve fee error", e);
-        }
+        } catch (Exception e) { log.error("[AA] resolve fee error", e); }
         return null;
     }
 
@@ -288,9 +303,7 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
                 if (tpl == null) continue;
                 if (hasGoodSkills(tpl) || hasGoodTriggers(tpl) || hasGoodStats(tpl)) return true;
             }
-        } catch (Exception e) {
-            log.error("AA: check good augment error", e);
-        }
+        } catch (Exception e) { log.error("[AA] check good augment error", e); }
         return false;
     }
 
@@ -301,12 +314,8 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
     }
 
     private static boolean hasGoodTriggers(OptionDataTemplate tpl) {
-        try {
-            String s = String.valueOf(tpl);
-            return s != null && s.toLowerCase().contains("trigger");
-        } catch (Exception e) {
-            return false;
-        }
+        String s = String.valueOf(tpl);
+        return s != null && s.toLowerCase().contains("trigger");
     }
 
     private static boolean hasGoodStats(OptionDataTemplate tpl) {
@@ -339,30 +348,9 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
         return parts.isEmpty() ? ("Option IDs: " + Arrays.toString(opts)) : String.join(" | ", parts);
     }
 
-    private static void addSkillDescriptions(OptionDataTemplate tpl, List<String> parts) {
-        List<Skill> skills = tpl.getSkills();
-        if (skills == null || skills.isEmpty()) return;
-        for (Skill skill : skills) {
-            String kind = skill.isActive() ? "Active" : (skill.isPassive() ? "Passive" : "Toggle");
-            parts.add(String.format("%s: %s Lv.%d", kind, skill.getName(), skill.getLevel()));
-        }
-    }
-
-    private static void addTriggerDescription(OptionDataTemplate tpl, List<String> parts) {
-        String s = String.valueOf(tpl);
-        if (s != null && s.toLowerCase().contains("trigger")) parts.add("Chance effect(s)");
-    }
-
-    private static void addStatDescriptions(OptionDataTemplate tpl, List<String> parts) {
-        String templateStr = String.valueOf(tpl).toUpperCase();
-        List<String> found = new ArrayList<>();
-        for (String stat : GOOD_STAT_WHITELIST) if (templateStr.contains(stat)) found.add(stat);
-        if (!found.isEmpty()) parts.add("Stats: " + String.join("/", found));
-    }
-
     private static int getVarStat(ItemInstance weapon, boolean first) {
         try { return first ? weapon.getVariationStat1() : weapon.getVariationStat2(); }
-        catch (Exception e) { log.error("AA: get var stat error", e); return 0; }
+        catch (Exception e) { log.error("[AA] get var stat error", e); return 0; }
     }
 
     private static boolean isEquipped(ItemInstance weapon) {
@@ -382,85 +370,42 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
             if (weapon.isHeroWeapon() || weapon.isCursed() || weapon.isShadowItem()) return false;
             List<VariationGroupData> list = VariationGroupHolder.getInstance().getDataForItemId(weapon.getItemId());
             return list != null && !list.isEmpty();
-        } catch (Exception e) {
-            log.error("AA: isAugmentable error", e);
-            return false;
-        }
+        } catch (Exception e) { log.error("[AA] isAugmentable error", e); return false; }
     }
 
     private static boolean recheck(Player player, ItemInstance weapon) {
         if (player == null || weapon == null) return false;
         try { return weapon.getOwnerId() == player.getObjectId(); }
-        catch (Exception e) { log.error("AA: ownership check error", e); return false; }
+        catch (Exception e) { log.error("[AA] ownership check error", e); return false; }
     }
 
-    // === Premium detection: hasBonus() + connection fallbacks ===
-    private static boolean isPremium(Player player) {
-        if (player == null) return false;
+    private static boolean safeIsGM(Player p) { try { return p.isGM(); } catch (Throwable ignored) { return false; } }
+    private static void safeMsg(Player player, String text) { try { player.sendMessage(text); } catch (Throwable ignored) { } }
 
-        if (PREMIUM_BYPASS_GM && safeIsGM(player)) {
-            if (log.isDebugEnabled()) log.debug("AA.premium: GM bypass for {}", player.getName());
-            return true;
+    private static void addSkillDescriptions(OptionDataTemplate tpl, List<String> parts) {
+        List<Skill> skills = tpl.getSkills();
+        if (skills == null || skills.isEmpty()) return;
+        for (Skill skill : skills) {
+            String kind = skill.isActive() ? "Active" : (skill.isPassive() ? "Passive" : "Toggle");
+            parts.add(String.format("%s: %s Lv.%d", kind, skill.getName(), skill.getLevel()));
         }
-
-        // 1) Player.hasBonus()
-        try {
-            boolean v = player.hasBonus();
-            if (log.isDebugEnabled()) log.debug("AA.premium: player.hasBonus()={} for {}", v, player.getName());
-            if (v) return true;
-        } catch (Throwable t) {
-            if (log.isDebugEnabled()) log.debug("AA.premium: player.hasBonus() not callable: {}", t.toString());
-        }
-
-        // 2) getNetConnection().hasBonus() / getBonusExpireTime()
-        try {
-            Object con = player.getNetConnection();
-            if (con != null) {
-                try {
-                    Method hb = con.getClass().getMethod("hasBonus");
-                    Object r = hb.invoke(con);
-                    boolean v = (r instanceof Boolean) ? (Boolean) r : "true".equalsIgnoreCase(String.valueOf(r));
-                    if (log.isDebugEnabled()) log.debug("AA.premium: conn.hasBonus()={} for {}", v, player.getName());
-                    if (v) return true;
-                } catch (NoSuchMethodException ignored) {
-                    try {
-                        Method getExp = con.getClass().getMethod("getBonusExpireTime");
-                        Object r = getExp.invoke(con);
-                        long exp = (r instanceof Number) ? ((Number) r).longValue() : 0L;
-                        long now = System.currentTimeMillis();
-                        if (log.isDebugEnabled()) log.debug("AA.premium: conn.getBonusExpireTime()={} now={}", exp, now);
-                        if (exp > now) return true;
-                    } catch (NoSuchMethodException ignored2) { }
-                }
-            }
-        } catch (Throwable t) {
-            if (log.isDebugEnabled()) log.debug("AA.premium: connection check failed: {}", t.toString());
-        }
-
-        // 3) Player.getBonusExpireTime() (понякога е в Player)
-        try {
-            Method m = Player.class.getMethod("getBonusExpireTime");
-            Object r = m.invoke(player);
-            long exp = (r instanceof Number) ? ((Number) r).longValue() : 0L;
-            long now = System.currentTimeMillis();
-            if (log.isDebugEnabled()) log.debug("AA.premium: player.getBonusExpireTime()={} now={}", exp, now);
-            if (exp > now) return true;
-        } catch (NoSuchMethodException ignored) {
-        } catch (Throwable t) {
-            if (log.isDebugEnabled()) log.debug("AA.premium: player.getBonusExpireTime() failed: {}", t.toString());
-        }
-
-        return false;
     }
 
-    private static boolean safeIsGM(Player p) {
-        try { return p.isGM(); } catch (Throwable ignored) { return false; }
+    private static void addTriggerDescription(OptionDataTemplate tpl, List<String> parts) {
+        // Без зависимост от getTriggers(), работи и на Interlude
+        String s = String.valueOf(tpl);
+        if (s != null && s.toLowerCase().contains("trigger")) parts.add("Chance effect(s)");
     }
 
-    private static void safeMsg(Player player, String text) {
-        try { player.sendMessage(text); } catch (Throwable ignored) { }
+    private static void addStatDescriptions(OptionDataTemplate tpl, List<String> parts) {
+        String templateStr = String.valueOf(tpl).toUpperCase();
+        List<String> found = new ArrayList<>();
+        for (String stat : GOOD_STAT_WHITELIST) if (templateStr.contains(stat)) found.add(stat);
+        if (!found.isEmpty()) parts.add("Stats: " + String.join("/", found));
     }
 
+
+    // Config
     private static void loadConfig() {
         try {
             File configFile = new File("config/AutoAugment.properties");
@@ -469,7 +414,6 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
                         PREMIUM_ONLY, PREMIUM_BYPASS_GM);
                 return;
             }
-
             ExProperties props = new ExProperties();
             props.load(configFile);
 
@@ -485,35 +429,26 @@ public final class AutoAugment implements ScriptFile, IItemHandler {
             PREMIUM_BYPASS_GM = parseBoolean(props.getProperty("PremiumBypassGM", String.valueOf(PREMIUM_BYPASS_GM)));
             PREMIUM_ONLY_MESSAGE = props.getProperty("PremiumOnly_Message", PREMIUM_ONLY_MESSAGE);
 
-            log.info("AutoAugment: config loaded. PremiumOnly={}, BypassGM={}, LifeStones={}",
+            log.info("AutoAugment: config loaded. PremiumOnly={}, BypassGM={}, LS.count={}",
                     PREMIUM_ONLY, PREMIUM_BYPASS_GM, LIFE_STONES.size());
         } catch (Exception e) {
             log.error("AutoAugment: config load failed. Using defaults.", e);
         }
     }
 
-    private static boolean parseBoolean(String value) { return "true".equalsIgnoreCase(value); }
-
+    private static boolean parseBoolean(String value) {
+        return value != null && value.trim().equalsIgnoreCase("true");
+    }
     private static Set<Integer> parseIntSet(String str) {
         if (str == null || str.trim().isEmpty()) return new LinkedHashSet<>();
-        return Arrays.stream(str.split(","))
-                .map(String::trim).filter(s -> !s.isEmpty())
-                .map(s -> {
-                    try { return Integer.parseInt(s); }
-                    catch (NumberFormatException e) { log.warn("AutoAugment: invalid int '{}'", s); return null; }
-                })
-                .filter(Objects::nonNull)
-                .collect(Collectors.toCollection(LinkedHashSet::new));
+        return Arrays.stream(str.split(",")).map(String::trim).filter(s -> !s.isEmpty()).map(s -> {
+            try { return Integer.parseInt(s); } catch (NumberFormatException e) { log.warn("[AA] invalid int '{}'", s); return null; }
+        }).filter(Objects::nonNull).collect(Collectors.toCollection(LinkedHashSet::new));
     }
-
     private static Set<String> parseStrSet(String str) {
         if (str == null || str.trim().isEmpty()) return new LinkedHashSet<>();
-        return Arrays.stream(str.split(","))
-                .map(String::trim).filter(s -> !s.isEmpty())
-                .map(String::toUpperCase)
-                .collect(Collectors.toCollection(LinkedHashSet::new));
+        return Arrays.stream(str.split(",")).map(String::trim).filter(s -> !s.isEmpty()).map(String::toUpperCase).collect(Collectors.toCollection(LinkedHashSet::new));
     }
-
     private static String joinInts(Collection<Integer> c) { return c.stream().map(String::valueOf).collect(Collectors.joining(",")); }
     private static String joinStr(Collection<String> c) { return String.join(",", c); }
 }
